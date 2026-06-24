@@ -30,6 +30,16 @@ const pockets: Pocket[] = [
   {x: 900, y: 500},
 ]
 
+const pocketOpeningsX = [450]
+const pocketOpeningsY = [225, 275]
+const pocketCutout = 45
+
+function nearAnyPocketX(y: number) {
+  return pockets.some((p) => Math.abs(p.y - y) < pocketCutout)
+}
+function nearAnyPocketY(x: number) {
+  return pockets.some((p) => Math.abs(p.x - x) < pocketCutout)
+}
 
 function Ball({ x, y, color, onPointerDown }: BallProps) {
   return (
@@ -46,6 +56,7 @@ function Ball({ x, y, color, onPointerDown }: BallProps) {
         height: 30,
         borderRadius: "50%",
         background: color,
+        border: "1px solid black",
         cursor: "grab",
       }}
     />
@@ -118,37 +129,88 @@ function isInPocket(ball: Ball) {
 }
 
 function App() {
-  const [balls, setBalls] = useState<Ball[]>([
-    { id: "cue", x: 100, y: 200, vx: 0, vy: 0, color: "white" },
-    { id: "1", x: 300, y: 200, vx: 0, vy: 0, color: "yellow" },
-  ])
 
-  const [draggingId, setDraggingId] = useState<string | null>(null)
-  const lastPointer = useRef({ x: 0, y: 0})
-  const boardRef = useRef<HTMLDivElement>(null)
+  const BALL_R = 15
+  const BALL_GAP = 1
+  const ROW_SPACING = (BALL_R * 2 + BALL_GAP) * 0.87
+  const COL_SPACING = BALL_R * 2 + BALL_GAP 
+
+  const objectBallColors: Record<string, string> = {
+    "1": "yellow",
+    "2": "blue",
+    "3": "red",
+    "4": "purple",
+    "5": "orange",
+    "6": "green",
+    "7": "maroon",
+    "8": "black",
+    "9": "yellow",
+    "10": "blue",
+    "11": "red",
+    "12": "purple",
+    "13": "orange",
+    "14": "green",
+    "15": "maroon",
+  }
+
+  function createRack() {
+    const balls: Ball[] = [
+      { id: "cue", x: 120, y: 250, vx: 0, vy: 0, color: "white" },
+    ]
+
+    const startX = 650
+    const startY = 250
+
+    let n = 1
+
+    for (let row = 0; row < 5; row++) {
+      for (let i = 0; i <= row; i++) {
+        balls.push({
+          id: String(n),
+          x: startX + row * COL_SPACING,
+          y: startY - (row * BALL_R) + i * (BALL_R * 2),
+          vx: 0,
+          vy: 0,
+          color: objectBallColors[String(n)] ?? "gray",
+        })
+        n++
+      }
+    }
+
+    return balls
+  }
+
+  const [balls, setBalls] = useState<Ball[]>(createRack())
+
+  const [aiming, setAiming] = useState(false)
+  const aimStart = useRef({ x: 0, y: 0})
+  const aimCurrent = useRef({ x: 0, y: 0})
 
   const updateBallPosition = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!draggingId) return
+    if (!aiming) return
 
     const rect = e.currentTarget.getBoundingClientRect()
-    const x = e.clientX - rect.left
-    const y = e.clientY - rect.top
-
-    const dx = x - lastPointer.current.x
-    const dy = y - lastPointer.current.y
-
-    lastPointer.current = { x, y }
-
-    setBalls((prev) =>
-             prev.map((ball) => 
-               ball.id === draggingId ? { ...ball, x, y, vx: dx * 0.2, vy: dy * 0.2 } : ball
-             )
-            )
+    aimCurrent.current = {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+    }
   }
 
   const endDrag = () => {
-    if (!draggingId) return
-      setDraggingId(null)
+    if (!aiming) return
+
+    const dx = aimStart.current.x - aimCurrent.current.x
+    const dy = aimStart.current.y - aimCurrent.current.y
+    const power = 0.08
+
+    setBalls((prev) =>
+             prev.map((ball) =>
+                      ball.id === "cue"
+                      ? { ...ball, vx: dx * power, vy: dy * power, }
+                      : ball
+                     )
+            )
+      setAiming(false)
   }
 
   const radius = 15
@@ -156,43 +218,52 @@ function App() {
   const height = 500
   const friction = 0.985
 
+  const boardRef = useRef<HTMLDivElement>(null)
+
   useEffect(() => {
     let frameId = 0
 
     const step = () => {
       setBalls((prev) => {
         let nextBalls = prev.map((ball) => {
-                 if (ball.id === draggingId) return ball
+                 if (ball.id === "cue" && aiming) return ball
 
                   let nextX = ball.x + ball.vx
                   let nextY = ball.y + ball.vy
 
+                  const stopSpeed = 0.03
+
                   let nextVx = ball.vx * friction
                   let nextVy = ball.vy * friction
 
+                  if (Math.abs(nextVx) < stopSpeed) nextVx = 0
+                  if (Math.abs(nextVy) < stopSpeed) nextVy = 0
+
                   if (nextX < radius) {
-                    nextX = radius
-                    nextVx *= -1
+                    if (!nearAnyPocketX(nextY)) {
+                      nextX = radius
+                      nextVx *= -1
+                    }
                   } else if (nextX > width - radius) {
-                    nextX = width - radius
-                    nextVx *= -1
+                    if (!nearAnyPocketX(nextY)) {
+                      nextX = width - radius
+                      nextVx *= -1
+                    }
                   } 
 
                   if (nextY < radius) {
-                    nextY = radius
-                    nextVy *= -1
+                    if (!nearAnyPocketY(nextX)) {
+                      nextY = radius
+                      nextVy *= -1
+                    }
                   } else if (nextY > height - radius) {
-                    nextY = height - radius
-                    nextVy *= -1
+                    if (!nearAnyPocketY(nextX)) {
+                      nextY = height - radius
+                      nextVy *= -1
+                    }
                   }
 
-                  return {
-                    ...ball,
-                    x: nextX,
-                    y: nextY,
-                    vx: nextVx,
-                    vy: nextVy,
-                  }
+                  return { ...ball, x: nextX, y: nextY, vx: nextVx, vy: nextVy, }
                })
 
                for (let i = 0; i < nextBalls.length; i++) {
@@ -214,8 +285,10 @@ function App() {
     frameId = requestAnimationFrame(step)
 
     return () => cancelAnimationFrame(frameId)
-  }, [draggingId])
+  }, [aiming])
 
+  const cuePos = balls.find((ball) => ball.id === "cue")
+  const cueCenter = cuePos ? { x: cuePos.x, y: cuePos.y } : { x: 0, y: 0 }
   return (
     <div
     ref={boardRef}
@@ -235,22 +308,44 @@ function App() {
       <Pocket key={i} x={p.x} y={p.y} />
     ))}
 
+
+    {aiming && (
+      <div
+      style={{
+        position: "absolute",
+        left: cueCenter.x,
+        top: cueCenter.y,
+        width: Math.hypot( aimCurrent.current.x - aimStart.current.x, aimCurrent.current.y - aimStart.current.y),
+        height: 4,
+        background: "white",
+        transformOrigin: "0 0",
+        transform: `rotate(${Math.atan2(
+          cueCenter.y - aimCurrent.current.y,
+          cueCenter.x - aimCurrent.current.x
+        )}rad)`,
+        pointerEvents: "none",
+        zIndex: 10,
+      }}
+      />
+    )}
+
       {balls.map((ball) => (
         <Ball
           key={ball.id}
           x={ball.x}
           y={ball.y}
           color={ball.color}
-          onPointerDown={(e) => {
+          onPointerDown={ball.id === "cue" ? (e) => {
             const rect = boardRef.current?.getBoundingClientRect()
             if (!rect) return
 
-            lastPointer.current = {
-              x: e.clientX - rect.left,
-              y: e.clientY - rect.top,
-            }
-            setDraggingId(ball.id)
-          }}
+              const x = e.clientX - rect.left
+              const y = e.clientY - rect.top
+
+            aimStart.current = { x, y }
+            aimCurrent.current = { x, y }
+            setAiming(true)
+          } : undefined}
         />
       ))}
     </div>
