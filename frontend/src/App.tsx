@@ -1,9 +1,11 @@
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 
 type Ball = {
   id: string
   x: number
   y: number
+  vx: number
+  vy: number
   color: string
 }
 
@@ -32,7 +34,10 @@ const pockets: Pocket[] = [
 function Ball({ x, y, color, onPointerDown }: BallProps) {
   return (
     <div
-      onPointerDown={onPointerDown}
+      onPointerDown={(e) => {
+        e.currentTarget.setPointerCapture(e.pointerId)
+        onPointerDown?.()
+      }}
       style={{
         position: "absolute",
         left: x - 15,
@@ -66,11 +71,12 @@ function Pocket({ x, y }: Pocket) {
 
 function App() {
   const [balls, setBalls] = useState<Ball[]>([
-    { id: "cue", x: 100, y: 200, color: "white" },
-    { id: "1", x: 300, y: 200, color: "yellow" },
+    { id: "cue", x: 100, y: 200, vx: 0, vy: 0, color: "white" },
+    { id: "1", x: 300, y: 200, vx: 0, vy: 0, color: "yellow" },
   ])
 
   const [draggingId, setDraggingId] = useState<string | null>(null)
+  const lastPointer = useRef({ x: 0, y: 0})
 
   const updateBallPosition = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!draggingId) return
@@ -79,18 +85,53 @@ function App() {
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
 
+    const dx = x - lastPointer.current.x
+    const dy = y - lastPointer.current.y
+
+    lastPointer.current = { x, y }
+
     setBalls((prev) =>
-      prev.map((ball) =>
-        ball.id === draggingId ? { ...ball, x, y } : ball
-      )
-    )
+             prev.map((ball) => 
+               ball.id === draggingId ? { ...ball, x, y, vx: dx * 0.2, vy: dy * 0.2 } : ball
+             )
+            )
   }
+
+  const endDrag = () => {
+    if (!draggingId) return
+      setDraggingId(null)
+  }
+
+  useEffect(() => {
+    let frameId = 0
+
+    const step = () => {
+      setBalls((prev) =>
+               prev.map((ball) => {
+                 if (ball.id === draggingId) return ball
+                   return {
+                 ...ball,
+                 x: ball.x + ball.vx,
+                 y: ball.y + ball.vy,
+                 vx: ball.vx * 0.99,
+                 vy: ball.vy * 0.99,
+               }
+               })
+                       )
+
+                       frameId = requestAnimationFrame(step)
+    }
+
+    frameId = requestAnimationFrame(step)
+
+    return () => cancelAnimationFrame(frameId)
+  }, [draggingId])
 
   return (
     <div
       onPointerMove={updateBallPosition}
-      onPointerUp={() => setDraggingId(null)}
-      onPointerLeave={() => setDraggingId(null)}
+      onPointerUp={endDrag}
+      onPointerLeave={endDrag}
       style={{
         width: 900,
         height: 500,
