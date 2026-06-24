@@ -14,6 +14,21 @@ type BallProps = {
   onPointerDown?: () => void
 }
 
+type Pocket = {
+  x: number
+  y: number
+}
+
+const pockets: Pocket[] = [
+  {x: 0, y: 0},
+  {x: 450, y: 0},
+  {x: 900, y: 0},
+  {x: 0, y: 500},
+  {x: 450, y: 500},
+  {x: 900, y: 500},
+]
+
+
 function Ball({ x, y, color, onPointerDown }: BallProps) {
   return (
     <div
@@ -28,6 +43,23 @@ function Ball({ x, y, color, onPointerDown }: BallProps) {
         background: color,
         cursor: "grab",
       }}
+    />
+  )
+}
+
+function Pocket({ x, y }: Pocket) {
+  return (
+    <div 
+    style={{
+      position: "absolute",
+      left: x - 18,
+      top: y - 18,
+      width: 36,
+      height: 36,
+      borderRadius: "50%",
+      background: "black",
+      zIndex: 0,
+    }}
     />
   )
 }
@@ -65,8 +97,13 @@ function App() {
         position: "relative",
         background: "green",
         margin: "80px auto",
+        overflow: "hidden",
       }}
     >
+    {pockets.map((p, i) => (
+      <Pocket key={i} x={p.x} y={p.y} />
+    ))}
+
       {balls.map((ball) => (
         <Ball
           key={ball.id}
