@@ -1,78 +1,187 @@
-import { useEffect, useRef, useState } from "react"
-import { nearPocketMouth, shouldSink, resolveBallCollision, createRack, simulateShot, stepPhysics, isAtRest, } from "./game/engine"
-import type { BallState, BallProps, PocketPosition, Player, StepResult, GameState, Shot } from "./game/types"
-import { TABLE_W, TABLE_H, BALL_RADIUS, POCKET_VISUAL_DIAMETER, POCKET_VISUAL_RADIUS, pocketImages, pockets, } from "./game/constants"
+import { useCallback, useEffect, useRef, useState } from "react"
+import { resolveTurn, applyShot, createRack, stepPhysics, isAtRest } from "./game/engine"
+import type { GameState, Shot } from "./game/types"
+import { TABLE_W, TABLE_H, pockets } from "./game/constants"
 import Ball from "./components/Ball"
 import Pocket from "./components/Pocket"
+import AiPreviewGrid from "./components/AiPreviewGrid"
 
-export default function App() {
-  const [gameState, setGameState] = useState<GameState>({
+type CandidateShot = {
+  angle: number
+  power: number
+  fitness: number
+  target_id?: string | null
+}
+
+function cloneBalls(balls: GameState["balls"]) {
+  return balls.map((ball) => ({ ...ball }))
+}
+
+function freshGameState(): GameState {
+  return {
     balls: createRack(),
-    currentPlayer: "human",
+    currentPlayer: "ai",
     gameOver: false,
     winner: null,
+    lastShotPocketed: [],
     currentShotPocketed: [],
-  })
+    needsAiMove: true,
+  }
+}
 
-  const [aiming, setAiming] = useState(false)
+function hasCueBall(state: GameState) {
+  return state.balls.some((b) => b.id === "cue")
+}
 
-  const aimStart = useRef({ x: 0, y: 0 })
-  const aimCurrent = useRef({ x: 0, y: 0 })
-  const boardRef = useRef<HTMLDivElement>(null)
+function isValidShot(shot: Partial<Shot>): shot is Shot {
+  return (
+    typeof shot.angle === "number" &&
+    Number.isFinite(shot.angle) &&
+    typeof shot.power === "number" &&
+    Number.isFinite(shot.power)
+  )
+}
 
-  const updateBallPosition = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!aiming) return
+export default function App() {
+  const [gameState, setGameState] = useState<GameState>(freshGameState)
+  const [candidates, setCandidates] = useState<CandidateShot[]>([])
+  const [previewBalls, setPreviewBalls] = useState<GameState["balls"]>([])
+  const [previewActive, setPreviewActive] = useState(false)
 
-      const rect = e.currentTarget.getBoundingClientRect()
-      aimCurrent.current = {
-        x: e.clientX - rect.left,
-        y: e.clientY - rect.top,
+  const shotActiveRef = useRef(false)
+  const aiBusyRef = useRef(false)
+  const aiTimerRef = useRef<number | null>(null)
+
+  // single source of truth for physics between frames
+  const ballsRef = useRef<GameState["balls"]>(createRack())
+  const pocketedRef = useRef<string[]>([])
+
+  const getAiShot = useCallback(async (state: GameState): Promise<Shot & { candidates?: CandidateShot[] }> => {
+    const res = await fetch("http://localhost:8000/predict-shot", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(state),
+    })
+
+    if (!res.ok) {
+      throw new Error(`AI request failed: ${res.status}`)
+    }
+
+    return res.json()
+  }, [])
+
+  const clearAiTimer = useCallback(() => {
+    if (aiTimerRef.current !== null) {
+      window.clearTimeout(aiTimerRef.current)
+      aiTimerRef.current = null
+    }
+  }, [])
+
+  const startAiMove = useCallback(
+    async (state: GameState) => {
+      console.log("startAiMove called", {
+        currentPlayer: state.currentPlayer,
+        gameOver: state.gameOver,
+        shotActive: shotActiveRef.current,
+        aiBusy: aiBusyRef.current,
+        balls: state.balls.map((b) => b.id),
+      })
+
+      if (aiBusyRef.current) return
+      if (shotActiveRef.current) return
+      if (state.gameOver) return
+      if (state.currentPlayer !== "ai") return
+      if (!state.needsAiMove) return
+      if (!hasCueBall(state)) {
+        console.log("blocked: no cue ball in state", state.balls.map((b) => b.id))
+        return
       }
-  }
 
-  const endDrag = () => {
-    if (!aiming || gameState.gameOver) return
+      aiBusyRef.current = true
 
-      const dx = aimStart.current.x - aimCurrent.current.x
-      const dy = aimStart.current.y - aimCurrent.current.y
-      const angle = Math.atan2(dy, dx)
-      const power = Math.hypot(dx, dy) * 0.3
+      try {
+        const shot = await getAiShot(state)
+        console.log("AI shot returned", shot)
 
-      setGameState((prev) => simulateShot(prev, { angle, power }))
-      setAiming(false)
-  }
+        if (!isValidShot(shot)) {
+          throw new Error("AI returned an invalid shot")
+        }
 
+        const nextCandidates = (shot.candidates ?? []).slice(0, 3)
+        setCandidates(nextCandidates)
+        setPreviewBalls(cloneBalls(state.balls))
+        setPreviewActive(nextCandidates.length > 0)
 
+        const nextBalls = applyShot(state.balls, shot.angle, shot.power)
+        console.log("applyShot cue velocity", nextBalls.find((b) => b.id === "cue"))
 
-  const cue = gameState.balls.find((ball) => ball.id === "cue")
-  const cueCenter = cue ? { x: cue.x, y: cue.y } : { x: 0, y: 0 }
+        // commit immediately to both React state and physics ref
+        ballsRef.current = nextBalls
+        pocketedRef.current = []
+        shotActiveRef.current = true
 
-  const cueAngle = Math.atan2(
-    cueCenter.y - aimCurrent.current.y,
-    cueCenter.x - aimCurrent.current.x
+        setGameState((prev) => ({
+          ...prev,
+          balls: nextBalls,
+          currentShotPocketed: [],
+          needsAiMove: false,
+        }))
+      } catch (err) {
+        console.error("startAiMove error", err)
+        setGameState((prev) => ({ ...prev, needsAiMove: true }))
+      } finally {
+        aiBusyRef.current = false
+      }
+    },
+    [getAiShot]
   )
-
-  const cueLength = 430
-
-  const cuePull = Math.min(
-    Math.hypot(
-      aimCurrent.current.x - cueCenter.x,
-      aimCurrent.current.y - cueCenter.y
-    ),
-    120
-  )
-
-  const power = cuePull / 120
-  const tipOffset = -20 - power * 200
 
   useEffect(() => {
     let frameId = 0
 
     const step = () => {
-      setGameState((prev) => ({
-        ...prev,
-        balls: stepPhysics(prev.balls).balls,
-      }))
+      if (shotActiveRef.current) {
+        const result = stepPhysics(ballsRef.current)
+        ballsRef.current = result.balls
+        pocketedRef.current = [...pocketedRef.current, ...result.pocketed]
+
+        setGameState((prev) => {
+          const nextState: GameState = {
+            ...prev,
+            balls: result.balls,
+            currentShotPocketed: pocketedRef.current,
+          }
+
+          if (!isAtRest(result.balls)) {
+            return nextState
+          }
+
+          const resolved = resolveTurn(nextState)
+          shotActiveRef.current = false
+          pocketedRef.current = []
+
+          console.log("turn resolved", {
+            pocketed: nextState.currentShotPocketed,
+            before: prev.balls.map((b) => b.id),
+            after: resolved.balls.map((b) => b.id),
+            currentPlayer: resolved.currentPlayer,
+          })
+
+          setCandidates([])
+          setPreviewBalls([])
+          setPreviewActive(false)
+
+          ballsRef.current = resolved.balls
+
+          return {
+            ...resolved,
+            needsAiMove: !resolved.gameOver && resolved.currentPlayer === "ai",
+          }
+        })
+      }
+
       frameId = requestAnimationFrame(step)
     }
 
@@ -80,72 +189,48 @@ export default function App() {
     return () => cancelAnimationFrame(frameId)
   }, [])
 
+  useEffect(() => {
+    clearAiTimer()
 
+    if (!gameState.needsAiMove) return
+    if (shotActiveRef.current || aiBusyRef.current || gameState.gameOver) return
+    if (gameState.currentPlayer !== "ai") return
+    if (!hasCueBall(gameState)) return
+
+    aiTimerRef.current = window.setTimeout(() => {
+      void startAiMove(gameState)
+    }, 100)
+
+    return clearAiTimer
+  }, [gameState, startAiMove, clearAiTimer])
 
   return (
-    <div
-    ref={boardRef}
-    onPointerMove={updateBallPosition}
-    onPointerUp={endDrag}
-    onPointerLeave={endDrag}
-    style={{
-      width: TABLE_W,
-      height: TABLE_H,
-      position: "relative",
-      margin: "80px auto",
-      backgroundImage: "url('/assets/pool-table.png')",
-      backgroundSize: "100% 100%",
-      backgroundRepeat: "no-repeat",
-    }}
-    >
-    {pockets.map((p, i) => (
-      <Pocket key={i} x={p.x} y={p.y} />
-    ))}
+    <>
+      <div
+        style={{
+          width: TABLE_W,
+          height: TABLE_H,
+          position: "relative",
+          margin: "80px auto",
+          backgroundImage: "url('/assets/pool-table.png')",
+          backgroundSize: "100% 100%",
+          backgroundRepeat: "no-repeat",
+        }}
+      >
+        {pockets.map((p, i) => (
+          <Pocket key={i} x={p.x} y={p.y} />
+        ))}
 
+        {gameState.balls.map((ball) => (
+          <Ball key={ball.id} id={ball.id} x={ball.x} y={ball.y} />
+        ))}
+      </div>
 
-    {aiming && (
-      <img
-      src="/assets/pool_stick.png"
-      alt=""
-      draggable={false}
-      style={{
-        position: "absolute",
-        left: cueCenter.x,
-        top: cueCenter.y,
-        width: cueLength,          // adjust to your cue PNG
-        height: "auto",
-        pointerEvents: "none",
-        userSelect: "none",
-        zIndex: 9,
-        transformOrigin: `${cueLength - tipOffset}px 50%`,
-        transform: ` translate(-${cueLength - tipOffset}px, -50%) rotate(${cueAngle}rad) `,
-      }}
-      />
-    )}
-
-    {gameState.balls.map((ball) => (
-      <Ball
-      key={ball.id}
-      id={ball.id}
-      x={ball.x}
-      y={ball.y}
-      onPointerDown={
-        ball.id === "cue"
-          ? (e) => {
-            const rect = boardRef.current?.getBoundingClientRect()
-            if (!rect) return
-
-              const x = e.clientX - rect.left
-              const y = e.clientY - rect.top
-
-              aimStart.current = { x, y }
-              aimCurrent.current = { x, y }
-              setAiming(true)
-          }
-            : undefined
-      }
-      />
-    ))}
-    </div>
+      {previewActive && previewBalls.length > 0 && candidates.length > 0 && (
+        <div style={{ width: TABLE_W, margin: "0 auto 24px auto" }}>
+          <AiPreviewGrid balls={previewBalls} candidates={candidates} />
+        </div>
+      )}
+    </>
   )
 }

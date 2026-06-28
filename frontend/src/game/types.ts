@@ -14,8 +14,8 @@ type Shot = {
 
 type GameState = {
   balls: BallState[]
-  currentPlayer: Player
   gameOver: boolean
+  needsAiMove: boolean
   winner: Player | null
   lastShotPocketed: string[]
   currentShotPocketed: string[]
