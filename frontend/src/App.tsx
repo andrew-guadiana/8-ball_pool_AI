@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { resolveTurn, applyShot, createRack, stepPhysics, isAtRest } from "./game/engine"
-import type { GameState, Shot } from "./game/types"
+import type { GameState, Shot, TrainingStatus } from "./game/types"
 import { TABLE_W, TABLE_H, pockets } from "./game/constants"
 import Ball from "./components/Ball"
 import Pocket from "./components/Pocket"
@@ -47,6 +47,7 @@ export default function App() {
   const [candidates, setCandidates] = useState<CandidateShot[]>([])
   const [previewBalls, setPreviewBalls] = useState<GameState["balls"]>([])
   const [previewActive, setPreviewActive] = useState(false)
+  const [trainingStatus, setTrainingStatus] = useState<TrainingStatus | null>(null)
 
   const shotActiveRef = useRef(false)
   const aiBusyRef = useRef(false)
@@ -55,6 +56,29 @@ export default function App() {
   // single source of truth for physics between frames
   const ballsRef = useRef<GameState["balls"]>(createRack())
   const pocketedRef = useRef<string[]>([])
+
+  useEffect(() => {
+  let alive = true
+
+  const loadStatus = async () => {
+    try {
+      const res = await fetch("http://localhost:8000/training-status")
+      if (!res.ok) return
+      const data = (await res.json()) as TrainingStatus
+      if (alive) setTrainingStatus(data)
+    } catch (err) {
+      console.error("Failed to load training status", err)
+    }
+  }
+
+  void loadStatus()
+  const timer = window.setInterval(loadStatus, 1500)
+
+  return () => {
+    alive = false
+    window.clearInterval(timer)
+  }
+}, [])
 
   const getAiShot = useCallback(async (state: GameState): Promise<Shot & { candidates?: CandidateShot[] }> => {
     const res = await fetch("http://localhost:8000/predict-shot", {
@@ -206,6 +230,11 @@ export default function App() {
 
   return (
     <>
+    <div>
+    <h1>Generation: {trainingStatus?.generation ?? 0}</h1>
+    <p>Best score: {trainingStatus?.best_score?.toFixed(2) ?? "0.00"}</p>
+  </div>
+
       <div
         style={{
           width: TABLE_W,

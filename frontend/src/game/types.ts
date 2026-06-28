@@ -1,3 +1,11 @@
+
+type TrainingStatus = {
+  generation: number
+  best_score: number
+  champion_path: string
+  updated_at?: number
+}
+
 type BallState = {
   id: string
   x: number
@@ -11,6 +19,7 @@ type Shot = {
   angle: number
   power: number
 }
+
 
 type GameState = {
   balls: BallState[]
@@ -41,4 +50,4 @@ type StepResult = {
   pocketed: string[]
 }
 
-export type { BallState, BallProps, Pocket, Player, StepResult, Shot, GameState }
+export type { TrainingStatus, BallState, BallProps, Pocket, Player, StepResult, Shot, GameState }

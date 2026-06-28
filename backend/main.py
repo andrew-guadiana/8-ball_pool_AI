@@ -9,6 +9,9 @@ import torch.nn as nn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import json
+from pathlib import Path
+import time
 
 app = FastAPI()
 app.add_middleware(
@@ -18,6 +21,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class TrainingStatus(BaseModel):
+    generation: int = 0
+    best_score: float = 0.0
+    champion_path: str = "shot_policy.pt"
+    updated_at: Optional[float] = None
 
 class Ball(BaseModel):
     id: str
@@ -81,7 +90,7 @@ POCKETS = [
 
 DIAG = math.hypot(TABLE_W, TABLE_H)
 
-FEATURE_DIM = 14
+FEATURE_DIM = 83
 MODEL_PATH = Path("shot_policy.pt")
 DEVICE = torch.device("cpu")
 
@@ -100,6 +109,29 @@ class ShotPolicy(nn.Module):
         return self.net(x).squeeze(-1)
 
 POLICY = ShotPolicy().to(DEVICE)
+
+STATUS_PATH = Path("training_status.json")
+MODEL_MTIME = 0.0
+
+
+def maybe_reload_policy() -> None:
+    global MODEL_MTIME
+
+    if not MODEL_PATH.exists():
+        return
+
+    mtime = MODEL_PATH.stat().st_mtime
+    if mtime <= MODEL_MTIME:
+        return
+
+    try:
+        state = torch.load(MODEL_PATH, map_location=DEVICE)
+        POLICY.load_state_dict(state)
+        POLICY.eval()
+        MODEL_MTIME = mtime
+        print(f"Reloaded policy from {MODEL_PATH}")
+    except Exception as err:
+        print(f"Could not reload policy: {err}")
 
 def load_policy() -> None:
     if MODEL_PATH.exists():
@@ -288,28 +320,42 @@ def build_features(state: GameState, angle: float, power: float, target: Ball) -
     if cue is None:
         return [0.0] * FEATURE_DIM
 
-    dx = target.x - cue.x
-    dy = target.y - cue.y
-    cue_target_dist = dist(cue.x, cue.y, target.x, target.y)
-    pocket_dist = min(dist(target.x, target.y, px, py) for px, py in POCKETS)
-    object_count = sum(1 for b in state.balls if b.id != "cue")
+    # Fixed lookup so every ball always lands in the same slot.
+    ball_by_id = {b.id: b for b in state.balls}
 
-    return [
+    feats: list[float] = []
+
+    # Cue ball: exists, x, y, vx, vy
+    feats.extend([
+        1.0,
         cue.x / TABLE_W,
         cue.y / TABLE_H,
         cue.vx / MAX_POWER,
         cue.vy / MAX_POWER,
-        target.x / TABLE_W,
-        target.y / TABLE_H,
-        dx / TABLE_W,
-        dy / TABLE_H,
-        cue_target_dist / DIAG,
-        pocket_dist / DIAG,
+    ])
+
+    # Object balls 1..15 in fixed order
+    for ball_id in map(str, range(1, 16)):
+        b = ball_by_id.get(ball_id)
+        if b is None:
+            feats.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+        else:
+            feats.extend([
+                1.0,
+                b.x / TABLE_W,
+                b.y / TABLE_H,
+                b.vx / MAX_POWER,
+                b.vy / MAX_POWER,
+            ])
+
+    # Candidate shot
+    feats.extend([
         math.sin(angle),
         math.cos(angle),
         power / MAX_POWER,
-        object_count / 15.0,
-    ]
+    ])
+
+    return feats
 
 @torch.no_grad()
 def policy_score_candidate(state: GameState, angle: float, power: float, target: Ball) -> float:
@@ -368,4 +414,16 @@ def health():
 
 @app.post("/predict-shot", response_model=PredictionResponse)
 def predict_shot(state: GameState):
+    maybe_reload_policy()
     return predict(state)
+
+@app.get("/training-status", response_model=TrainingStatus)
+def training_status():
+    if STATUS_PATH.exists():
+        try:
+            data = json.loads(STATUS_PATH.read_text())
+            return TrainingStatus(**data)
+        except Exception:
+            pass
+
+    return TrainingStatus()
