@@ -218,10 +218,13 @@ function respotCueBall(balls: Ball[]) {
 
 export function resolveTurn(state: GameState): GameState {
   const shotPocketed = state.currentShotPocketed ?? []
+
   const cueMissing = !state.balls.some((b) => b.id === "cue")
   const cuePocketed = shotPocketed.includes("cue")
 
-  if (cuePocketed || cueMissing) {
+  const rackCleared = state.balls.every((b) => b.id === "cue")
+
+  if (cuePocketed || cueMissing || rackCleared) {
     return {
       balls: createRack(),
       currentPlayer: "ai",

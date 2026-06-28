@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
-import random
+from pathlib import Path
 from typing import Optional
 
+import torch
+import torch.nn as nn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -76,6 +78,43 @@ POCKETS = [
     (TABLE_W / 2, TABLE_H - 50.0),
     (TABLE_W - 57.0, TABLE_H - 43.0),
 ]
+
+DIAG = math.hypot(TABLE_W, TABLE_H)
+
+FEATURE_DIM = 14
+MODEL_PATH = Path("shot_policy.pt")
+DEVICE = torch.device("cpu")
+
+class ShotPolicy(nn.Module):
+    def __init__(self, in_dim: int = FEATURE_DIM):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+POLICY = ShotPolicy().to(DEVICE)
+
+def load_policy() -> None:
+    if MODEL_PATH.exists():
+        try:
+            state = torch.load(MODEL_PATH, map_location=DEVICE)
+            POLICY.load_state_dict(state)
+            print(f"Loaded policy from {MODEL_PATH}")
+        except Exception as err:
+            print(f"Could not load policy: {err}")
+
+def save_policy() -> None:
+    torch.save(POLICY.state_dict(), MODEL_PATH)
+
+load_policy()
+POLICY.eval()
 
 def dist(x1: float, y1: float, x2: float, y2: float) -> float:
     return math.hypot(x2 - x1, y2 - y1)
@@ -202,7 +241,12 @@ def step_physics(balls: list[Ball]) -> tuple[list[Ball], list[str]]:
 
     return kept, pocketed
 
-def rollout(balls: list[Ball], angle: float, power: float, max_steps: int = 180) -> tuple[list[Ball], list[str], bool]:
+def rollout(
+    balls: list[Ball],
+    angle: float,
+    power: float,
+    max_steps: int = 180,
+) -> tuple[list[Ball], list[str], bool]:
     current = apply_shot(balls, angle, power)
     pocketed: list[str] = []
     scratched = False
@@ -234,35 +278,47 @@ def choose_target_ball(balls: list[Ball]) -> Optional[Ball]:
         + min(dist(b.x, b.y, px, py) for px, py in POCKETS) * 0.4,
     )
 
-def score_shot(state: GameState, angle: float, power: float, target_id: str) -> float:
-    final_balls, pocketed, scratched = rollout(state.balls, angle, power)
-
-    score = 0.0
-
-    if "cue" in pocketed:
-        score -= 2500.0
-    if scratched:
-        score -= 2500.0
-    if target_id in pocketed:
-        score += 1800.0
-
-    target = next((b for b in final_balls if b.id == target_id), None)
-    if target is None:
-        score += 1200.0
-    else:
-        pocket_dist = min(dist(target.x, target.y, px, py) for px, py in POCKETS)
-        score += max(0.0, 240.0 - pocket_dist * 1.5)
-
-    cue = next((b for b in final_balls if b.id == "cue"), None)
-    if cue is not None:
-        score += max(0.0, 250.0 - dist(cue.x, cue.y, TABLE_W * 0.5, TABLE_H * 0.5) * 0.5)
-
-    return score
-
 def make_candidate_angles(target: Ball, cue: Ball) -> list[float]:
     base = math.atan2(target.y - cue.y, target.x - cue.x)
     offsets = [-0.35, -0.2, -0.1, 0.0, 0.1, 0.2, 0.35]
     return [base + o for o in offsets]
+
+def build_features(state: GameState, angle: float, power: float, target: Ball) -> list[float]:
+    cue = next((b for b in state.balls if b.id == "cue"), None)
+    if cue is None:
+        return [0.0] * FEATURE_DIM
+
+    dx = target.x - cue.x
+    dy = target.y - cue.y
+    cue_target_dist = dist(cue.x, cue.y, target.x, target.y)
+    pocket_dist = min(dist(target.x, target.y, px, py) for px, py in POCKETS)
+    object_count = sum(1 for b in state.balls if b.id != "cue")
+
+    return [
+        cue.x / TABLE_W,
+        cue.y / TABLE_H,
+        cue.vx / MAX_POWER,
+        cue.vy / MAX_POWER,
+        target.x / TABLE_W,
+        target.y / TABLE_H,
+        dx / TABLE_W,
+        dy / TABLE_H,
+        cue_target_dist / DIAG,
+        pocket_dist / DIAG,
+        math.sin(angle),
+        math.cos(angle),
+        power / MAX_POWER,
+        object_count / 15.0,
+    ]
+
+@torch.no_grad()
+def policy_score_candidate(state: GameState, angle: float, power: float, target: Ball) -> float:
+    feats = torch.tensor(
+        build_features(state, angle, power, target),
+        dtype=torch.float32,
+        device=DEVICE,
+    ).unsqueeze(0)
+    return float(POLICY(feats).item())
 
 def predict(state: GameState) -> PredictionResponse:
     cue = next((b for b in state.balls if b.id == "cue"), None)
@@ -283,7 +339,8 @@ def predict(state: GameState) -> PredictionResponse:
     for angle in angles:
         for power in powers:
             power = clamp(power, 0.0, MAX_POWER)
-            fitness = score_shot(state, angle, power, target.id)
+
+            fitness = policy_score_candidate(state, angle, power, target)
             cand = CandidateShot(
                 angle=angle,
                 power=power,
