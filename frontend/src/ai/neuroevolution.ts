@@ -37,6 +37,9 @@ const MIN_POWER = 8
 const SIM_STEPS = 120
 const PROBE_COUNT = 4
 
+const ROLLOUT_SHOTS = 3
+const ROLLOUT_DISCOUNT = 0.875
+
 function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(max, v))
 }
@@ -106,6 +109,7 @@ function mutate(g: Genome) {
   mutateArray(g.w2)
   mutateArray(g.b2)
 }
+
 
 function forward(genome: Genome, inputs: number[]): number[] {
   const hidden = new Array<number>(HIDDEN).fill(0)
@@ -190,6 +194,16 @@ function encodeState(state: GameState): number[] {
   return inputs.slice(0, INPUTS)
 }
 
+function predictShotFromGenome(genome: Genome, state: GameState): Shot {
+  const inputs = encodeState(state)
+  const out = forward(genome, inputs)
+
+  const angle = out[0] * Math.PI * 2
+  const power = MIN_POWER + out[1] * (MAX_POWER - MIN_POWER)
+
+  return { angle, power }
+}
+
 function simulateShot(state: GameState, shot: Shot): GameState {
   const shotBalls = applyShot(state.balls, shot.angle, shot.power)
 
@@ -218,31 +232,36 @@ function simulateShot(state: GameState, shot: Shot): GameState {
 }
 
 function evaluateGenome(genome: Genome, state: GameState): EvalResult {
-  const inputs = encodeState(state)
-  const out = forward(genome, inputs)
-
-  const angle = out[0] * Math.PI * 2
-  const power = MIN_POWER + out[1] * (MAX_POWER - MIN_POWER)
-  const shot: Shot = { angle, power }
-
-  const beforeObjects = objectBalls(state).length
-  const beforeHasCue = !!cueBall(state)
-
-  const resolved = simulateShot(state, shot)
-  const afterObjects = objectBalls(resolved).length
-
-  const removedBalls = beforeObjects - afterObjects
-  const cueStillAlive = !!cueBall(resolved)
-
+  let currentState = cloneState(state)
   let fitness = 0
-  fitness += removedBalls * 180
+  let shot: Shot = { angle: 0, power: MIN_POWER }
 
-  if (!cueStillAlive && beforeHasCue) fitness -= 1500
-  if (resolved.gameOver && resolved.winner === "ai") fitness += 500
-  if (resolved.gameOver && resolved.winner === "human") fitness -= 250
+  for (let step = 0; step < ROLLOUT_SHOTS; step++) {
+    const beforeObjects = objectBalls(currentState).length
+    const beforeHasCue = !!cueBall(currentState)
 
-  const movedSomething = resolved.balls.some((b) => Math.abs(b.vx) > 0.01 || Math.abs(b.vy) > 0.01)
-  if (!movedSomething) fitness -= 80
+    shot = predictShotFromGenome(genome, currentState)
+    const resolved = simulateShot(currentState, shot)
+
+    const afterObjects = objectBalls(resolved).length
+    const removedBalls = beforeObjects - afterObjects
+    const cueStillAlive = !!cueBall(resolved)
+
+    let stepFitness = 0
+    stepFitness += removedBalls * 180
+
+    if (!cueStillAlive && beforeHasCue) stepFitness -= 2500
+    if (resolved.gameOver && resolved.winner === "ai") stepFitness += 500
+    if (resolved.gameOver && resolved.winner === "human") stepFitness -= 250
+
+    fitness += stepFitness * Math.pow(ROLLOUT_DISCOUNT, step)
+
+    currentState = resolved
+
+    if (resolved.gameOver) break
+    if (!cueBall(currentState)) break
+    if (objectBalls(currentState).length === 0) break
+  }
 
   return { fitness, shot }
 }
