@@ -23,16 +23,19 @@ type EvalResult = {
   shot: Shot
 }
 
-const INPUTS = 34
-const HIDDEN = 24
+const OBJECT_SLOTS = 15
+const INPUTS = 40
+const HIDDEN = 32
 const OUTPUTS = 2
 
-const POP_SIZE = 72
-const ELITE_COUNT = 8
-const MUTATION_RATE = 0.15
-const MUTATION_SCALE = 0.35
-const MAX_POWER = 60
+const POP_SIZE = 36
+const ELITE_COUNT = 6
+const MUTATION_RATE = 0.12
+const MUTATION_SCALE = 0.28
+const MAX_POWER = 100
 const MIN_POWER = 8
+const SIM_STEPS = 120
+const PROBE_COUNT = 4
 
 function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(max, v))
@@ -43,7 +46,8 @@ function randRange(min: number, max: number) {
 }
 
 function randn() {
-  let u = 0, v = 0
+  let u = 0
+  let v = 0
   while (u === 0) u = Math.random()
   while (v === 0) v = Math.random()
   return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v)
@@ -109,13 +113,17 @@ function forward(genome: Genome, inputs: number[]): number[] {
 
   for (let h = 0; h < HIDDEN; h++) {
     let sum = genome.b1[h]
-    for (let i = 0; i < INPUTS; i++) sum += inputs[i] * genome.w1[i * HIDDEN + h]
+    for (let i = 0; i < INPUTS; i++) {
+      sum += inputs[i] * genome.w1[i * HIDDEN + h]
+    }
     hidden[h] = tanh(sum)
   }
 
   for (let o = 0; o < OUTPUTS; o++) {
     let sum = genome.b2[o]
-    for (let h = 0; h < HIDDEN; h++) sum += hidden[h] * genome.w2[h * OUTPUTS + o]
+    for (let h = 0; h < HIDDEN; h++) {
+      sum += hidden[h] * genome.w2[h * OUTPUTS + o]
+    }
     outputs[o] = sigmoid(sum)
   }
 
@@ -130,80 +138,54 @@ function objectBalls(state: GameState) {
   return state.balls.filter((b) => b.id !== "cue")
 }
 
-function nearestObjects(state: GameState, count = 6) {
-  const cue = cueBall(state)
-  if (!cue) return []
-
+function sortedObjectBalls(state: GameState) {
   return objectBalls(state)
-    .map((b) => {
-      const dx = b.x - cue.x
-      const dy = b.y - cue.y
-      return {
-        ball: b,
-        dx,
-        dy,
-        dist: Math.hypot(dx, dy),
-      }
-    })
-    .sort((a, b) => a.dist - b.dist)
-    .slice(0, count)
+    .slice()
+    .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }))
 }
 
 function encodeState(state: GameState): number[] {
   const cue = cueBall(state)
-
   const inputs: number[] = []
 
-  // cue ball
+  // Cue ball x, y
   if (cue) {
     inputs.push(cue.x / TABLE_W)
     inputs.push(cue.y / TABLE_H)
-    inputs.push(clamp(cue.vx / 25, -1, 1))
-    inputs.push(clamp(cue.vy / 25, -1, 1))
   } else {
-    inputs.push(0, 0, 0, 0)
+    inputs.push(0, 0)
   }
 
-  // object ball count
-  inputs.push(objectBalls(state).length / 15)
+  // Number of object balls left
+  inputs.push(clamp(objectBalls(state).length / OBJECT_SLOTS, 0, 1))
 
-  // cue-to-pocket geometry
+  // Cue-to-pocket distances
   if (cue) {
     for (const p of pockets) {
       const dx = p.x - cue.x
       const dy = p.y - cue.y
-      inputs.push(clamp(dx / TABLE_W, -1, 1))
-      inputs.push(clamp(dy / TABLE_H, -1, 1))
       inputs.push(clamp(Math.hypot(dx, dy) / Math.hypot(TABLE_W, TABLE_H), 0, 1))
     }
   } else {
-    for (let i = 0; i < pockets.length * 3; i++) inputs.push(0)
+    for (let i = 0; i < pockets.length; i++) inputs.push(0)
   }
 
-  // nearest balls
-  const near = nearestObjects(state, 6)
-  for (let i = 0; i < 6; i++) {
-    const item = near[i]
-    if (!item || !cue) {
-      inputs.push(0, 0, 1, 0)
+  // Every object ball in a stable order
+  const balls = sortedObjectBalls(state)
+  for (let i = 0; i < OBJECT_SLOTS; i++) {
+    const b = balls[i]
+    if (!b) {
+      inputs.push(0, 0)
       continue
     }
 
-    inputs.push(clamp(item.dx / TABLE_W, -1, 1))
-    inputs.push(clamp(item.dy / TABLE_H, -1, 1))
-    inputs.push(clamp(item.dist / Math.hypot(TABLE_W, TABLE_H), 0, 1))
-
-    const angle = Math.atan2(item.dy, item.dx) / Math.PI
-    inputs.push(angle)
+    inputs.push(clamp(b.x / TABLE_W, 0, 1))
+    inputs.push(clamp(b.y / TABLE_H, 0, 1))
   }
 
-  // pocket cluster pressure
-  for (const p of pockets) {
-    const ballsNearPocket = objectBalls(state).filter((b) => Math.hypot(b.x - p.x, b.y - p.y) < 80).length
-    inputs.push(clamp(ballsNearPocket / 3, 0, 1))
-  }
+  // Game over flag
+  inputs.push(state.gameOver ? 1 : 0)
 
-  // fill to INPUTS
   while (inputs.length < INPUTS) inputs.push(0)
   return inputs.slice(0, INPUTS)
 }
@@ -213,7 +195,8 @@ function simulateShot(state: GameState, shot: Shot): GameState {
 
   let simBalls = shotBalls
   let pocketed: string[] = []
-  for (let i = 0; i < 240; i++) {
+
+  for (let i = 0; i < SIM_STEPS; i++) {
     const result = stepPhysics(simBalls)
     simBalls = result.balls
     pocketed = pocketed.concat(result.pocketed)
@@ -240,7 +223,6 @@ function evaluateGenome(genome: Genome, state: GameState): EvalResult {
 
   const angle = out[0] * Math.PI * 2
   const power = MIN_POWER + out[1] * (MAX_POWER - MIN_POWER)
-
   const shot: Shot = { angle, power }
 
   const beforeObjects = objectBalls(state).length
@@ -249,33 +231,18 @@ function evaluateGenome(genome: Genome, state: GameState): EvalResult {
   const resolved = simulateShot(state, shot)
   const afterObjects = objectBalls(resolved).length
 
-  const pocketedCount = (state.currentShotPocketed?.length ?? 0) + (beforeObjects - afterObjects)
   const removedBalls = beforeObjects - afterObjects
   const cueStillAlive = !!cueBall(resolved)
 
   let fitness = 0
-
   fitness += removedBalls * 180
-  fitness += pocketedCount * 60
 
-  if (!cueStillAlive && beforeHasCue) fitness -= 250
+  if (!cueStillAlive && beforeHasCue) fitness -= 1500
   if (resolved.gameOver && resolved.winner === "ai") fitness += 500
   if (resolved.gameOver && resolved.winner === "human") fitness -= 250
 
   const movedSomething = resolved.balls.some((b) => Math.abs(b.vx) > 0.01 || Math.abs(b.vy) > 0.01)
   if (!movedSomething) fitness -= 80
-
-  const cue = cueBall(state)
-  if (cue) {
-    // small bias toward shots that are at least pointing at something useful
-    const near = nearestObjects(state, 1)[0]
-    if (near) {
-      const shotDir = { x: Math.cos(angle), y: Math.sin(angle) }
-      const toBall = { x: near.dx / (near.dist || 1), y: near.dy / (near.dist || 1) }
-      const alignment = shotDir.x * toBall.x + shotDir.y * toBall.y
-      fitness += alignment * 25
-    }
-  }
 
   return { fitness, shot }
 }
@@ -284,7 +251,7 @@ function pickBest<T extends { fitness: number }>(items: T[]) {
   return items.slice().sort((a, b) => b.fitness - a.fitness)
 }
 
-function topUniqueCandidates(results: Array<EvalResult & { target_id?: string | null }>, limit = 8): CandidateShot[] {
+function topUniqueCandidates(results: Array<EvalResult & { target_id?: string | null }>, limit = 6): CandidateShot[] {
   const sorted = pickBest(results)
   const out: CandidateShot[] = []
   const seen = new Set<string>()
@@ -308,18 +275,17 @@ function topUniqueCandidates(results: Array<EvalResult & { target_id?: string | 
 export class NeuroEvoTrainer {
   private population: Genome[]
   private champion: Genome | null = null
-  private recentStates: GameState[] = []
+  private latestSettledState: GameState | null = null
+
+  private stateBuffer: GameState[] = []
+  private readonly maxBufferSize = 300
+
   generation = 0
   bestScore = -Infinity
   championPath = "local-typescript"
 
   constructor(popSize = POP_SIZE) {
     this.population = Array.from({ length: popSize }, () => makeGenome())
-  }
-
-  recordState(state: GameState) {
-    this.recentStates.push(cloneState(state))
-    if (this.recentStates.length > 24) this.recentStates.shift()
   }
 
   getStatus(): TrainingStatus {
@@ -331,49 +297,65 @@ export class NeuroEvoTrainer {
     }
   }
 
+  recordState(state: GameState) {
+    if (!isAtRest(state.balls)) return
+
+    const cloned = cloneState(state)
+    this.latestSettledState = cloned
+    this.stateBuffer.push(cloned)
+
+    if (this.stateBuffer.length > this.maxBufferSize) {
+      this.stateBuffer.shift()
+    }
+  }
+
+  private sampleStates(count: number): GameState[] {
+    if (this.stateBuffer.length === 0) return []
+
+    const out: GameState[] = []
+    for (let i = 0; i < count; i++) {
+      const idx = Math.floor(Math.random() * this.stateBuffer.length)
+      out.push(this.stateBuffer[idx])
+    }
+    return out
+  }
+
   predictShot(state: GameState): Shot & { candidates: CandidateShot[] } {
     const genome = this.champion ?? this.population[0]
-    const baseInputs = encodeState(state)
-    const baseOut = forward(genome, baseInputs)
+    const base = evaluateGenome(genome, state)
 
-    const baseShot: Shot = {
-      angle: baseOut[0] * Math.PI * 2,
-      power: MIN_POWER + baseOut[1] * (MAX_POWER - MIN_POWER),
-    }
+    const candidates: Array<EvalResult & { target_id?: string | null }> = [{ ...base, target_id: null }]
 
-    const candidates: Array<EvalResult & { target_id?: string | null }> = []
-    candidates.push({ ...evaluateGenome(genome, state), target_id: null })
-
-    // mutate around the champion to produce preview candidates
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < PROBE_COUNT; i++) {
       const probe = makeGenome()
       probe.w1.set(genome.w1)
       probe.b1.set(genome.b1)
       probe.w2.set(genome.w2)
       probe.b2.set(genome.b2)
       mutate(probe)
-      const result = evaluateGenome(probe, state)
-      candidates.push({ ...result, target_id: null })
+      candidates.push({ ...evaluateGenome(probe, state), target_id: null })
     }
 
     const best = pickBest(candidates)[0]
     const unique = topUniqueCandidates(candidates, 6)
 
     return {
-      angle: best?.shot.angle ?? baseShot.angle,
-      power: best?.shot.power ?? baseShot.power,
+      angle: best?.shot.angle ?? base.shot.angle,
+      power: best?.shot.power ?? base.shot.power,
       candidates: unique,
     }
   }
 
-  trainStep() {
-    if (this.recentStates.length === 0) return
+  trainOneGeneration() {
+    if (this.stateBuffer.length === 0) return
 
-    const samples = this.recentStates.slice(-6)
+    const samples = this.sampleStates(20)
+    if (samples.length === 0) return
+
     const scored = this.population.map((genome) => {
       let fitness = 0
-      for (const state of samples) {
-        fitness += evaluateGenome(genome, state).fitness
+      for (const sample of samples) {
+        fitness += evaluateGenome(genome, sample).fitness
       }
       genome.fitness = fitness / samples.length
       return genome
@@ -402,7 +384,7 @@ export class NeuroEvoTrainer {
       fitness: g.fitness,
     }))
 
-    const next: Genome[] = elites
+    const next: Genome[] = [...elites]
 
     while (next.length < this.population.length) {
       const a = elites[Math.floor(Math.random() * elites.length)]
@@ -416,14 +398,11 @@ export class NeuroEvoTrainer {
     this.generation += 1
   }
 
-  trainLoop(stopSignal?: { stopped: boolean }) {
-    const tick = () => {
-      if (stopSignal?.stopped) return
-      this.trainStep()
-      setTimeout(tick, 0)
-    }
-    tick()
+  trainOnSettledTurn(state: GameState) {
+    this.recordState(state)
+    this.trainOneGeneration()
   }
 }
 
 export const trainer = new NeuroEvoTrainer()
+
