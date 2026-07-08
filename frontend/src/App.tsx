@@ -5,13 +5,7 @@ import { TABLE_W, TABLE_H, pockets } from "./game/constants"
 import Ball from "./components/Ball"
 import Pocket from "./components/Pocket"
 import AiPreviewGrid from "./components/AiPreviewGrid"
-
-type CandidateShot = {
-  angle: number
-  power: number
-  fitness: number
-  target_id?: string | null
-}
+import { trainer, type CandidateShot } from "./ai/neuroevolution"
 
 function cloneBalls(balls: GameState["balls"]) {
   return balls.map((ball) => ({ ...ball }))
@@ -53,47 +47,35 @@ export default function App() {
   const aiBusyRef = useRef(false)
   const aiTimerRef = useRef<number | null>(null)
 
-  // single source of truth for physics between frames
+  // Single source of truth for physics between frames.
   const ballsRef = useRef<GameState["balls"]>(createRack())
   const pocketedRef = useRef<string[]>([])
 
+  // Keep the latest React state available to RAF / timers without stale closures.
+  const gameStateRef = useRef<GameState>(freshGameState())
   useEffect(() => {
-  let alive = true
+    gameStateRef.current = gameState
+  }, [gameState])
 
-  const loadStatus = async () => {
-    try {
-      const res = await fetch("http://localhost:8000/training-status")
-      if (!res.ok) return
-      const data = (await res.json()) as TrainingStatus
-      if (alive) setTrainingStatus(data)
-    } catch (err) {
-      console.error("Failed to load training status", err)
+  useEffect(() => {
+    let alive = true
+
+    const updateStatus = () => {
+      if (!alive) return
+      setTrainingStatus(trainer.getStatus())
     }
-  }
 
-  void loadStatus()
-  const timer = window.setInterval(loadStatus, 1500)
+    updateStatus()
+    const timer = window.setInterval(updateStatus, 500)
 
-  return () => {
-    alive = false
-    window.clearInterval(timer)
-  }
-}, [])
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [])
 
   const getAiShot = useCallback(async (state: GameState): Promise<Shot & { candidates?: CandidateShot[] }> => {
-    const res = await fetch("http://localhost:8000/predict-shot", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(state),
-    })
-
-    if (!res.ok) {
-      throw new Error(`AI request failed: ${res.status}`)
-    }
-
-    return res.json()
+    return trainer.predictShot(state)
   }, [])
 
   const clearAiTimer = useCallback(() => {
@@ -139,22 +121,29 @@ export default function App() {
         setPreviewActive(nextCandidates.length > 0)
 
         const nextBalls = applyShot(state.balls, shot.angle, shot.power)
-        console.log("applyShot cue velocity", nextBalls.find((b) => b.id === "cue"))
 
-        // commit immediately to both React state and physics ref
+        // Commit immediately to both React state and physics ref.
         ballsRef.current = nextBalls
         pocketedRef.current = []
         shotActiveRef.current = true
 
-        setGameState((prev) => ({
-          ...prev,
-          balls: nextBalls,
-          currentShotPocketed: [],
-          needsAiMove: false,
-        }))
+        setGameState((prev) => {
+          const nextState: GameState = {
+            ...prev,
+            balls: nextBalls,
+            currentShotPocketed: [],
+            needsAiMove: false,
+          }
+          gameStateRef.current = nextState
+          return nextState
+        })
       } catch (err) {
         console.error("startAiMove error", err)
-        setGameState((prev) => ({ ...prev, needsAiMove: true }))
+        setGameState((prev) => {
+          const nextState = { ...prev, needsAiMove: true }
+          gameStateRef.current = nextState
+          return nextState
+        })
       } finally {
         aiBusyRef.current = false
       }
@@ -163,9 +152,27 @@ export default function App() {
   )
 
   useEffect(() => {
+    clearAiTimer()
+
+    if (!gameState.needsAiMove) return
+    if (shotActiveRef.current || aiBusyRef.current || gameState.gameOver) return
+    if (gameState.currentPlayer !== "ai") return
+    if (!hasCueBall(gameState)) return
+
+    aiTimerRef.current = window.setTimeout(() => {
+      void startAiMove(gameStateRef.current)
+    }, 100)
+
+    return clearAiTimer
+  }, [gameState, startAiMove, clearAiTimer])
+
+  useEffect(() => {
     let frameId = 0
 
     const step = () => {
+      const currentState = gameStateRef.current
+      trainer.recordState(currentState)
+
       if (shotActiveRef.current) {
         const result = stepPhysics(ballsRef.current)
         ballsRef.current = result.balls
@@ -179,6 +186,7 @@ export default function App() {
           }
 
           if (!isAtRest(result.balls)) {
+            gameStateRef.current = nextState
             return nextState
           }
 
@@ -186,23 +194,19 @@ export default function App() {
           shotActiveRef.current = false
           pocketedRef.current = []
 
-          console.log("turn resolved", {
-            pocketed: nextState.currentShotPocketed,
-            before: prev.balls.map((b) => b.id),
-            after: resolved.balls.map((b) => b.id),
-            currentPlayer: resolved.currentPlayer,
-          })
-
           setCandidates([])
           setPreviewBalls([])
           setPreviewActive(false)
 
           ballsRef.current = resolved.balls
 
-          return {
+          const finalState: GameState = {
             ...resolved,
             needsAiMove: !resolved.gameOver && resolved.currentPlayer === "ai",
           }
+
+          gameStateRef.current = finalState
+          return finalState
         })
       }
 
@@ -214,26 +218,20 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    clearAiTimer()
+    const stopSignal = { stopped: false }
+    trainer.trainLoop(stopSignal)
 
-    if (!gameState.needsAiMove) return
-    if (shotActiveRef.current || aiBusyRef.current || gameState.gameOver) return
-    if (gameState.currentPlayer !== "ai") return
-    if (!hasCueBall(gameState)) return
-
-    aiTimerRef.current = window.setTimeout(() => {
-      void startAiMove(gameState)
-    }, 100)
-
-    return clearAiTimer
-  }, [gameState, startAiMove, clearAiTimer])
+    return () => {
+      stopSignal.stopped = true
+    }
+  }, [])
 
   return (
     <>
-    <div>
-    <h1>Generation: {trainingStatus?.generation ?? 0}</h1>
-    <p>Best score: {trainingStatus?.best_score?.toFixed(2) ?? "0.00"}</p>
-  </div>
+      <div>
+        <h1>Generation: {trainingStatus?.generation ?? 0}</h1>
+        <p>Best score: {trainingStatus?.best_score?.toFixed(2) ?? "0.00"}</p>
+      </div>
 
       <div
         style={{
